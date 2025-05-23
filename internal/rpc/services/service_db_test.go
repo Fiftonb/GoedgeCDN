@@ -1,0 +1,20 @@
+package services
+
+import (
+	"testing"
+
+	"github.com/iwind/TeaGo/dbs"
+	"github.com/iwind/TeaGo/logs"
+)
+
+func TestDBService_FindAllDBTables(t *testing.T) {
+	db, err := dbs.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ones, _, err := db.FindPreparedOnes("SELECT * FROM information_schema.`TABLES` WHERE TABLE_SCHEMA=?", db.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs.PrintAsJSON(ones, t)
+}
