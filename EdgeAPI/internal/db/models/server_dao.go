@@ -2408,6 +2408,8 @@ func (this *ServerDAO) RenewServerTrafficLimitStatus(tx *dbs.Tx, trafficLimitCon
 	}
 
 	var server = serverOne.(*Server)
+	var currentDay = timeutil.Format("Ymd")
+	var currentMonth = timeutil.Format("Ym")
 
 	var oldStatus = &serverconfigs.TrafficLimitStatus{}
 	if IsNotNull(server.TrafficLimitStatus) {
@@ -2416,45 +2418,61 @@ func (this *ServerDAO) RenewServerTrafficLimitStatus(tx *dbs.Tx, trafficLimitCon
 			return err
 		}
 
-		// 如果已经达到限制了，而且还在有效期，那就没必要再更新
-		if !isUpdatingConfig && oldStatus.IsValid() {
-			return nil
+		// 检查限制状态是否仍然有效
+		if !isUpdatingConfig {
+			if oldStatus.DateType == "day" {
+				// 日限制只在当天有效
+				if oldStatus.UntilDay != currentDay {
+					oldStatus = &serverconfigs.TrafficLimitStatus{}
+				}
+			} else if oldStatus.DateType == "month" {
+				// 月限制在当月内有效
+				if oldStatus.UntilDay < currentDay {
+					oldStatus = &serverconfigs.TrafficLimitStatus{}
+				}
+			} else if oldStatus.DateType == "total" {
+				// 总流量限制持续有效
+				if oldStatus.IsValid() {
+					return nil
+				}
+			}
 		}
 	}
 
 	var untilDay = ""
+	var dateType = ""
 
 	// daily
-	var dateType = ""
 	if trafficLimitConfig.DailyBytes() > 0 {
-		if server.TrafficDay == timeutil.Format("Ymd") && server.TotalDailyTraffic >= float64(trafficLimitConfig.DailyBytes())/(1<<30) {
-			untilDay = timeutil.Format("Ymd")
+		if server.TrafficDay == currentDay && server.TotalDailyTraffic >= float64(trafficLimitConfig.DailyBytes())/(1<<30) {
+			untilDay = currentDay
 			dateType = "day"
 		}
 	}
 
 	// monthly
-	if server.TrafficMonth == timeutil.Format("Ym") && trafficLimitConfig.MonthlyBytes() > 0 {
-		if server.TotalMonthlyTraffic >= float64(trafficLimitConfig.MonthlyBytes())/(1<<30) {
+	if dateType == "" && trafficLimitConfig.MonthlyBytes() > 0 {
+		if server.TrafficMonth == currentMonth && server.TotalMonthlyTraffic >= float64(trafficLimitConfig.MonthlyBytes())/(1<<30) {
 			untilDay = timeutil.Format("Ym32")
 			dateType = "month"
 		}
 	}
 
 	// totally
-	if trafficLimitConfig.TotalBytes() > 0 {
+	if dateType == "" && trafficLimitConfig.TotalBytes() > 0 {
 		if server.TotalTraffic >= float64(trafficLimitConfig.TotalBytes())/(1<<30) {
 			untilDay = "30000101"
 			dateType = "total"
 		}
 	}
 
-	var isChanged = oldStatus.UntilDay != untilDay
+	var isChanged = oldStatus.UntilDay != untilDay || oldStatus.DateType != dateType
 	if isChanged {
 		statusJSON, err := json.Marshal(&serverconfigs.TrafficLimitStatus{
 			UntilDay:   untilDay,
 			DateType:   dateType,
 			TargetType: serverconfigs.TrafficLimitTargetTraffic,
+			PlanId:     oldStatus.PlanId, // 保持原有的PlanId
 		})
 		if err != nil {
 			return err
@@ -2572,18 +2590,108 @@ func (this *ServerDAO) IncreaseServerTotalTraffic(tx *dbs.Tx, serverId int64, by
 	var gb = float64(bytes) / (1 << 30)
 	var day = timeutil.Format("Ymd")
 	var month = timeutil.Format("Ym")
-	return this.Query(tx).
-		Pk(serverId).
-		Set("totalDailyTraffic", dbs.SQL("IF(trafficDay=:day, totalDailyTraffic, 0)+:trafficGB")).
-		Set("totalMonthlyTraffic", dbs.SQL("IF(trafficMonth=:month, totalMonthlyTraffic, 0)+:trafficGB")).
-		Set("totalTraffic", dbs.SQL("totalTraffic+:trafficGB")).
-		Set("trafficDay", day).
-		Set("trafficMonth", month).
-		Param("day", day).
-		Param("month", month).
-		Param("trafficGB", gb).
-		UpdateQuickly()
 
+	// 先获取当前服务器状态
+	serverOne, err := this.Query(tx).
+		Pk(serverId).
+		Result("trafficDay", "trafficMonth", "trafficLimitStatus", "totalDailyTraffic", "totalMonthlyTraffic").
+		Find()
+	if err != nil {
+		return err
+	}
+	if serverOne == nil {
+		return nil
+	}
+
+	var server = serverOne.(*Server)
+	var oldTrafficDay = server.TrafficDay
+	var oldTrafficMonth = server.TrafficMonth
+
+	// 检查是否需要重置日流量和月流量
+	var resetDaily = oldTrafficDay != day
+	var resetMonthly = oldTrafficMonth != month
+
+	// 如果存在限制状态，需要特殊处理
+	if IsNotNull(server.TrafficLimitStatus) {
+		var status = &serverconfigs.TrafficLimitStatus{}
+		err = json.Unmarshal(server.TrafficLimitStatus, status)
+		if err != nil {
+			return err
+		}
+
+		// 如果是日限制且日期变更，需要清除限制状态
+		if status.DateType == "day" && resetDaily {
+			err = this.Query(tx).
+				Pk(serverId).
+				Set("trafficLimitStatus", dbs.SQL("NULL")).
+				UpdateQuickly()
+			if err != nil {
+				return err
+			}
+		}
+		// 如果是月限制且月份变更，需要清除限制状态
+		if status.DateType == "month" && resetMonthly {
+			err = this.Query(tx).
+				Pk(serverId).
+				Set("trafficLimitStatus", dbs.SQL("NULL")).
+				UpdateQuickly()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// 更新流量统计
+	var query = this.Query(tx).
+		Pk(serverId)
+
+	// 始终设置当前日期和月份
+	query.Set("trafficDay", day).
+		Set("trafficMonth", month)
+
+	// 处理日流量
+	if resetDaily {
+		// 重置日流量，但保持日期记录
+		query.Set("totalDailyTraffic", gb)
+	} else {
+		// 累加日流量
+		query.Set("totalDailyTraffic", dbs.SQL("totalDailyTraffic+:trafficGB"))
+	}
+
+	// 处理月流量
+	if resetMonthly {
+		// 重置月流量，但保持月份记录
+		query.Set("totalMonthlyTraffic", gb)
+	} else {
+		// 累加月流量
+		query.Set("totalMonthlyTraffic", dbs.SQL("totalMonthlyTraffic+:trafficGB"))
+	}
+
+	// 更新总流量
+	query.Set("totalTraffic", dbs.SQL("totalTraffic+:trafficGB")).
+		Param("trafficGB", gb)
+
+	err = query.UpdateQuickly()
+	if err != nil {
+		return err
+	}
+
+	// 检查并更新流量限制状态
+	if resetDaily || resetMonthly {
+		// 获取流量限制配置
+		limitConfig, err := this.FindServerTrafficLimitConfig(tx, serverId, nil)
+		if err != nil {
+			return err
+		}
+		if limitConfig != nil && limitConfig.IsOn {
+			err = this.RenewServerTrafficLimitStatus(tx, limitConfig, serverId, false)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // ResetServerTotalTraffic 重置服务总流量
